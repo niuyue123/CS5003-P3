@@ -1,249 +1,192 @@
-from flask import Flask, jsonify, request
-from flask_cors import CORS
-import sqlite3
+import socket
 import json
-from datetime import datetime
 import hashlib
 import time
-import requests
+import re
+import sqlite3
 
-app = Flask(__name__)
-CORS(app)
+DATABASE = "users.db"
 
-class PuzzleManager:
-    def __init__(self, conn):
-        self.conn = conn
-        self.cursor = conn.cursor()
-    
-    def get_puzzle_list(self, sort_by='date', order='desc', tag=None):
-        query = '''SELECT p.id, p.title, p.date, p.tags, p.solved_count, p.last_solved,
-                         u.username as author
-                  FROM puzzles p
-                  LEFT JOIN users u ON p.author_id = u.id'''
-        
-        if tag:
-            query += " WHERE p.tags LIKE ?"
-            self.cursor.execute(query, (f'%{tag}%',))
-        else:
-            self.cursor.execute(query)
-        
-        puzzles = []
-        for row in self.cursor.fetchall():
-            puzzles.append({
-                'id': row[0],
-                'title': row[1],
-                'date': row[2],
-                'tags': json.loads(row[3]),
-                'solved_count': row[4],
-                'last_solved': row[5],
-                'author': row[6]
-            })
-        
-        return sorted(puzzles, 
-                     key=lambda x: x[sort_by],
-                     reverse=(order == 'desc'))
-    
-    def get_puzzle_by_id(self, puzzle_id):
-        self.cursor.execute('''SELECT p.*, u.username as author
-                             FROM puzzles p
-                             LEFT JOIN users u ON p.author_id = u.id
-                             WHERE p.id = ?''', (puzzle_id,))
-        row = self.cursor.fetchone()
-        if row:
-            return {
-                'id': row[0],
-                'title': row[1],
-                'date': row[2],
-                'tags': json.loads(row[3]),
-                'grid': json.loads(row[4]),
-                'clues': json.loads(row[5]),
-                'solution_key': json.loads(row[6]),
-                'author_id': row[7],
-                'author': row[8]
-            }
-        return None
-
-class SubmissionManager:
-    def __init__(self, conn):
-        self.conn = conn
-        self.cursor = conn.cursor()
-    
-    def submit_solution(self, puzzle_id, user_id, grid, time_taken):
-        # Get the correct solution
-        self.cursor.execute('SELECT solution_key FROM puzzles WHERE id = ?', (puzzle_id,))
-        solution_key = json.loads(self.cursor.fetchone()[0])
-        
-        # Compare solutions
-        incorrect_cells = []
-        for i in range(len(grid)):
-            for j in range(len(grid[i])):
-                if grid[i][j].upper() != solution_key[i][j]:
-                    incorrect_cells.append((i, j))
-        
-        is_correct = len(incorrect_cells) == 0
-        
-        # Record submission
-        self.cursor.execute('''INSERT INTO submissions 
-                             (user_id, puzzle_id, grid_submitted, time_taken, 
-                              result, incorrect_cells)
-                             VALUES (?, ?, ?, ?, ?, ?)''',
-                          (user_id, puzzle_id, json.dumps(grid), time_taken,
-                           'correct' if is_correct else 'incorrect',
-                           json.dumps(incorrect_cells)))
-        
-        # Update puzzle stats
-        if is_correct:
-            self.cursor.execute('''UPDATE puzzles 
-                                 SET solved_count = solved_count + 1,
-                                     last_solved = CURRENT_TIMESTAMP
-                                 WHERE id = ?''', (puzzle_id,))
-        
-        self.conn.commit()
-        
-        return {
-            'submission_id': self.cursor.lastrowid,
-            'result': 'correct' if is_correct else 'incorrect',
-            'incorrect_cells': incorrect_cells
-        }
-
-class StatisticsManager:
-    def __init__(self, conn):
-        self.conn = conn
-        self.cursor = conn.cursor()
-    
-    def get_user_stats(self, user_id):
-        # Get basic stats
-        self.cursor.execute('''SELECT puzzles_solved, avg_time, last_login
-                             FROM user_stats
-                             WHERE user_id = ?''', (user_id,))
-        row = self.cursor.fetchone()
-        
-        if not row:
-            return {
-                'puzzles_solved': 0,
-                'avg_time': 0,
-                'last_login': None
-            }
-        
-        return {
-            'puzzles_solved': row[0],
-            'avg_time': row[1],
-            'last_login': row[2]
-        }
-    
-    def get_puzzle_stats(self, puzzle_id):
-        self.cursor.execute('''SELECT solved_count, last_solved
-                             FROM puzzles
-                             WHERE id = ?''', (puzzle_id,))
-        row = self.cursor.fetchone()
-        
-        if not row:
-            return None
-        
-        return {
-            'solved_count': row[0],
-            'last_solved': row[1]
-        }
-
+# Initialize the database and create the 'users' table if it doesn't exist
 def init_db():
-    conn = sqlite3.connect('crosswords.db')
-    c = conn.cursor()
-    
-    # Users table
-    c.execute('''CREATE TABLE IF NOT EXISTS users
-                 (id INTEGER PRIMARY KEY AUTOINCREMENT,
-                  username TEXT UNIQUE NOT NULL,
-                  password_hash TEXT NOT NULL,
-                  created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP)''')
-    
-    # User stats table
-    c.execute('''CREATE TABLE IF NOT EXISTS user_stats
-                 (user_id INTEGER PRIMARY KEY,
-                  puzzles_solved INTEGER DEFAULT 0,
-                  avg_time FLOAT DEFAULT 0,
-                  last_login TIMESTAMP,
-                  FOREIGN KEY (user_id) REFERENCES users(id))''')
-    
-    # Puzzles table
-    c.execute('''CREATE TABLE IF NOT EXISTS puzzles
-                 (id INTEGER PRIMARY KEY AUTOINCREMENT,
-                  title TEXT NOT NULL,
-                  date TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-                  tags TEXT NOT NULL,
-                  grid TEXT NOT NULL,
-                  clues TEXT NOT NULL,
-                  solution_key TEXT NOT NULL,
-                  author_id INTEGER,
-                  solved_count INTEGER DEFAULT 0,
-                  last_solved TIMESTAMP,
-                  FOREIGN KEY (author_id) REFERENCES users(id))''')
-    
-    # Submissions table
-    c.execute('''CREATE TABLE IF NOT EXISTS submissions
-                 (id INTEGER PRIMARY KEY AUTOINCREMENT,
-                  user_id INTEGER,
-                  puzzle_id INTEGER,
-                  grid_submitted TEXT NOT NULL,
-                  time_taken FLOAT NOT NULL,
-                  result TEXT NOT NULL,
-                  incorrect_cells TEXT,
-                  timestamp TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-                  FOREIGN KEY (user_id) REFERENCES users(id),
-                  FOREIGN KEY (puzzle_id) REFERENCES puzzles(id))''')
-    
-    conn.commit()
-    return conn
+    try:
+        conn = sqlite3.connect(DATABASE)  # Connect to the SQLite database
+        c = conn.cursor()
+        c.execute('''CREATE TABLE IF NOT EXISTS users (
+                        username TEXT PRIMARY KEY, 
+                        password_hash TEXT)''')  # Create table if not exists
+        conn.commit()  # Commit the transaction
+    except sqlite3.Error as e:
+        print(f"[DB ERROR] Failed to initialize database: {e}")
+    finally:
+        conn.close()  # Close the database connection
 
+# Load all users from the database
+def load_users():
+    try:
+        conn = sqlite3.connect(DATABASE)  # Connect to the SQLite database
+        c = conn.cursor()
+        c.execute("SELECT username, password_hash FROM users")  # Retrieve all users
+        rows = c.fetchall()  # Fetch all results
+        return {row[0]: row[1] for row in rows}  # Return users as a dictionary
+    except sqlite3.Error as e:
+        print(f"[DB ERROR] Failed to load users: {e}")
+        return {}  # Return empty dictionary in case of error
+    finally:
+        conn.close()  # Close the database connection
+
+# Save users to the database, updating existing ones if necessary
+def save_users(users):
+    try:
+        conn = sqlite3.connect(DATABASE)  # Connect to the SQLite database
+        c = conn.cursor()
+        for username, password_hash in users.items():
+            c.execute("INSERT OR REPLACE INTO users (username, password_hash) VALUES (?, ?)",
+                      (username, password_hash))  # Insert or replace the user
+        conn.commit()  # Commit the transaction
+    except sqlite3.Error as e:
+        print(f"[DB ERROR] Failed to save users: {e}")
+    finally:
+        conn.close()  # Close the database connection
+
+# Class to manage user sessions (login state)
+class SessionManager:
+    def __init__(self):
+        self.sessions = {}  # Store active sessions in a dictionary
+
+    # Create a new session for the user and return a token
+    def create_session(self, user_id):
+        timestamp = int(time.time())  # Current timestamp
+        token = hashlib.sha256(f"{user_id}-{timestamp}".encode()).hexdigest()  # Generate a unique token
+        self.sessions[token] = {"user_id": user_id, "expiry": time.time() + 1800}  # Store session with expiry
+        return token
+
+    # Validate if the session token is valid and not expired
+    def validate_session(self, token):
+        if not isinstance(token, str) or len(token) != 64 or not token.isalnum():
+            return False  # Token format check
+        session = self.sessions.get(token)
+        if not session or time.time() > session["expiry"]:  # Check if session expired
+            self.sessions.pop(token, None)  # Remove expired session
+            return False
+        return True
+
+    # Destroy a session by removing the token
+    def destroy_session(self, token):
+        self.sessions.pop(token, None)
+
+# Hash a password using SHA-256
 def hash_password(password):
-    return hashlib.sha256(password.encode()).hexdigest()
+    return hashlib.sha256(password.encode('utf-8')).hexdigest()
 
-# Initialize managers
-conn = init_db()
-puzzle_manager = PuzzleManager(conn)
-submission_manager = SubmissionManager(conn)
-stats_manager = StatisticsManager(conn)
+# Generate a standard response format for API calls
+def make_response(status, message, data=None):
+    return json.dumps({
+        "status": status,
+        "message": message,
+        "data": data or {}
+    })
 
-@app.route('/api/register', methods=['POST'])
-def register():
-    # User registration logic
+# Validate if the username is alphanumeric and 3-20 characters long
+def is_valid_username(username):
+    return bool(re.fullmatch(r"^[a-zA-Z0-9]{3,20}$", username))
 
-@app.route('/api/login', methods=['POST'])
-def login():
-    # User authentication logic
+# Handle the login request by checking the provided credentials
+def handle_login(username, hashed_password):
+    users = load_users()  # Load all users
+    stored_hash = users.get(username)  # Retrieve stored password hash for the username
+    return stored_hash and stored_hash == hashed_password  # Return True if credentials match
 
-@app.route('/api/puzzles', methods=['GET'])
-def get_puzzles():
-    # Get all puzzles
+# Receive data from a socket until a newline is encountered
+def recv_until_newline(sock):
+    buffer = ''
+    try:
+        while True:
+            chunk = sock.recv(4096).decode('utf-8')  # Receive data in chunks
+            if not chunk:
+                break
+            buffer += chunk
+            if '\n' in buffer:  # Stop when newline is found
+                break
+        return buffer.strip()
+    except (ConnectionResetError, OSError) as e:
+        print(f"[SOCKET ERROR] Error receiving data: {e}")
+        return ''  # Return empty string on error
 
-@app.route('/api/puzzles/<int:puzzle_id>', methods=['GET'])
-def get_puzzle(puzzle_id):
-    puzzle = puzzle_manager.get_puzzle_by_id(puzzle_id)
-    if puzzle:
-        return jsonify(puzzle)
-    return jsonify({'error': 'Puzzle not found'}), 404
+# Handle client requests such as register, login, and logout
+def handle_client_request(data, session_manager):
+    try:
+        request = json.loads(data)  # Parse the incoming JSON request
+        action = request.get("action")  # Get the action from the request
+        payload = request.get("payload", {})  # Extract payload
+        token = request.get("auth_token")  # Extract token for session validation
 
-@app.route('/api/puzzles/<int:puzzle_id>/validate', methods=['POST'])
-def validate_answer(puzzle_id):
-    # Validate puzzle answer
+        if action == "register":
+            username = payload.get("username", "")
+            password = payload.get("password", "")
 
-@app.route('/api/users/<int:user_id>/statistics', methods=['GET'])
-def get_user_statistics(user_id):
-    # Get user statistics
+            # Validate the username and password
+            if not is_valid_username(username):
+                return make_response("error", "Registration failed", {"username": "Invalid username, should be 3-20 alphanumeric characters"})
 
-@app.route('/api/puzzles/<int:puzzle_id>/submit', methods=['POST'])
-def submit_solution(puzzle_id):
-    data = request.json
-    user_id = data.get('user_id')
-    grid = data.get('grid')
-    time_taken = data.get('time_taken')
-    
-    result = submission_manager.submit_solution(puzzle_id, user_id, grid, time_taken)
-    return jsonify(result)
+            users = load_users()
+            if username in users:
+                return make_response("error", "Registration failed", {"username": "Username already exists"})
 
-@app.route('/api/users/<int:user_id>/stats', methods=['GET'])
-def get_user_stats(user_id):
-    stats = stats_manager.get_user_stats(user_id)
-    return jsonify(stats)
+            if len(password) < 8:
+                return make_response("error", "Registration failed", {"password": "Password must be at least 8 characters long"})
 
-if __name__ == '__main__':
-    app.run(debug=True, port=5000) 
+            users[username] = hash_password(password)  # Save the new user with hashed password
+            save_users(users)
+            token = session_manager.create_session(username)
+            return make_response("success", "Registration successful", {"auth_token": token})
+
+
+        elif action == "login":
+            username = payload.get("username", "")
+            password = payload.get("password", "")
+            hashed_password = hash_password(password)  # Hash the password before checking
+
+            if handle_login(username, hashed_password):
+                token = session_manager.create_session(username)  # Create a session token
+                return make_response("success", "Login successful", {"auth_token": token})
+            else:
+                return make_response("error", "Invalid username or password")
+
+        elif action == "logout":
+            if session_manager.validate_session(token):  # Validate the session token
+                session_manager.destroy_session(token)  # Destroy the session
+                return make_response("success", "Logout successful")
+            else:
+                return make_response("error", "Invalid or expired session")
+
+        else:
+            return make_response("error", "Unknown action")
+
+    except json.JSONDecodeError:
+        return make_response("error", "Invalid request format, expected JSON")
+    except Exception as e:
+        return make_response("error", f"Error processing request: {str(e)}")
+
+# Start the server and handle client connections
+def start_server(host, port):
+    session_manager = SessionManager()  # Initialize session manager
+    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as server_socket:
+        server_socket.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)  # Set socket options
+        server_socket.bind((host, port))  # Bind server to host and port
+        server_socket.listen(5)  # Start listening for incoming connections
+        print(f"Server listening on {host}:{port}...")
+
+        while True:
+            try:
+                client_socket, client_address = server_socket.accept()  # Accept a new client connection
+                with client_socket:
+                    print(f"Connection from {client_address}")
+                    data = recv_until_newline(client_socket)  # Receive client data
+                    if not data:
+                        continue
+                    print(f"Received request: {data}")
+                    response = handle_client_request(data, session_manager)  # Handle the request
+                    client_socket.sendall((response + '\n').encode('utf-8'))  # Send response back to client
+            except Exception as e:
+                print(f"[SERVER ERROR] Error handling client request: {e}")
