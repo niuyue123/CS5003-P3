@@ -5,188 +5,283 @@ import time
 import re
 import sqlite3
 
-DATABASE = "users.db"
+DATABASE = 'DATABASE-puzzles.db'
 
-# Initialize the database and create the 'users' table if it doesn't exist
 def init_db():
+    """Initialize database and create users table"""
     try:
-        conn = sqlite3.connect(DATABASE)  # Connect to the SQLite database
+        conn = sqlite3.connect(DATABASE)
         c = conn.cursor()
         c.execute('''CREATE TABLE IF NOT EXISTS users (
-                        username TEXT PRIMARY KEY, 
-                        password_hash TEXT)''')  # Create table if not exists
-        conn.commit()  # Commit the transaction
+                        id INTEGER PRIMARY KEY AUTOINCREMENT,
+                        username TEXT UNIQUE NOT NULL,
+                        password_hash TEXT NOT NULL,
+                        created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP)''')
+        conn.commit()
     except sqlite3.Error as e:
         print(f"[DB ERROR] Failed to initialize database: {e}")
     finally:
-        conn.close()  # Close the database connection
+        conn.close()
 
-# Load all users from the database
-def load_users():
-    try:
-        conn = sqlite3.connect(DATABASE)  # Connect to the SQLite database
-        c = conn.cursor()
-        c.execute("SELECT username, password_hash FROM users")  # Retrieve all users
-        rows = c.fetchall()  # Fetch all results
-        return {row[0]: row[1] for row in rows}  # Return users as a dictionary
-    except sqlite3.Error as e:
-        print(f"[DB ERROR] Failed to load users: {e}")
-        return {}  # Return empty dictionary in case of error
-    finally:
-        conn.close()  # Close the database connection
-
-# Save users to the database, updating existing ones if necessary
-def save_users(users):
-    try:
-        conn = sqlite3.connect(DATABASE)  # Connect to the SQLite database
-        c = conn.cursor()
-        for username, password_hash in users.items():
-            c.execute("INSERT OR REPLACE INTO users (username, password_hash) VALUES (?, ?)",
-                      (username, password_hash))  # Insert or replace the user
-        conn.commit()  # Commit the transaction
-    except sqlite3.Error as e:
-        print(f"[DB ERROR] Failed to save users: {e}")
-    finally:
-        conn.close()  # Close the database connection
-
-# Class to manage user sessions (login state)
 class SessionManager:
     def __init__(self):
-        self.sessions = {}  # Store active sessions in a dictionary
+        # Create sessions table
+        try:
+            conn = sqlite3.connect(DATABASE)
+            c = conn.cursor()
+            c.execute('''CREATE TABLE IF NOT EXISTS sessions (
+                        token TEXT PRIMARY KEY,
+                        user_id INTEGER NOT NULL,
+                        expiry REAL NOT NULL,
+                        FOREIGN KEY (user_id) REFERENCES users(id))''')
+            conn.commit()
+        except sqlite3.Error as e:
+            print(f"[DB ERROR] Failed to initialize sessions table: {e}")
+        finally:
+            if 'conn' in locals():
+                conn.close()
 
-    # Create a new session for the user and return a token
     def create_session(self, user_id):
-        timestamp = int(time.time())  # Current timestamp
-        token = hashlib.sha256(f"{user_id}-{timestamp}".encode()).hexdigest()  # Generate a unique token
-        self.sessions[token] = {"user_id": user_id, "expiry": time.time() + 1800}  # Store session with expiry
-        return token
+        """Create new session and return token"""
+        try:
+            timestamp = int(time.time())
+            token = hashlib.sha256(f"{user_id}-{timestamp}".encode()).hexdigest()
+            expiry = time.time() + 1800  # 30 minutes expiry
+            
+            conn = sqlite3.connect(DATABASE)
+            c = conn.cursor()
+            
+            # Delete old sessions for this user
+            c.execute("DELETE FROM sessions WHERE user_id = ?", (user_id,))
+            
+            # Create new session
+            c.execute("INSERT INTO sessions (token, user_id, expiry) VALUES (?, ?, ?)",
+                     (token, user_id, expiry))
+            conn.commit()
+            return token
+        except sqlite3.Error as e:
+            print(f"[DB ERROR] Failed to create session: {e}")
+            return None
+        finally:
+            if 'conn' in locals():
+                conn.close()
 
-    # Validate if the session token is valid and not expired
     def validate_session(self, token):
+        """Validate if session token is valid and not expired"""
         if not isinstance(token, str) or len(token) != 64 or not token.isalnum():
-            return False  # Token format check
-        session = self.sessions.get(token)
-        if not session or time.time() > session["expiry"]:  # Check if session expired
-            self.sessions.pop(token, None)  # Remove expired session
             return False
-        return True
+            
+        try:
+            conn = sqlite3.connect(DATABASE)
+            c = conn.cursor()
+            
+            # Clean expired sessions
+            c.execute("DELETE FROM sessions WHERE expiry < ?", (time.time(),))
+            
+            # Check if session exists and not expired
+            c.execute("SELECT COUNT(*) FROM sessions WHERE token = ? AND expiry > ?",
+                     (token, time.time()))
+            count = c.fetchone()[0]
+            
+            conn.commit()
+            return count > 0
+        except sqlite3.Error as e:
+            print(f"[DB ERROR] Failed to validate session: {e}")
+            return False
+        finally:
+            if 'conn' in locals():
+                conn.close()
 
-    # Destroy a session by removing the token
+    def get_user_id(self, token):
+        """Get user ID associated with session"""
+        if not isinstance(token, str) or len(token) != 64 or not token.isalnum():
+            return None
+            
+        try:
+            conn = sqlite3.connect(DATABASE)
+            c = conn.cursor()
+            
+            # Clean expired sessions
+            c.execute("DELETE FROM sessions WHERE expiry < ?", (time.time(),))
+            
+            # Get user ID
+            c.execute("SELECT user_id FROM sessions WHERE token = ? AND expiry > ?",
+                     (token, time.time()))
+            row = c.fetchone()
+            
+            conn.commit()
+            return row[0] if row else None
+        except sqlite3.Error as e:
+            print(f"[DB ERROR] Failed to get user_id: {e}")
+            return None
+        finally:
+            if 'conn' in locals():
+                conn.close()
+
     def destroy_session(self, token):
-        self.sessions.pop(token, None)
+        """Destroy session"""
+        try:
+            conn = sqlite3.connect(DATABASE)
+            c = conn.cursor()
+            c.execute("DELETE FROM sessions WHERE token = ?", (token,))
+            conn.commit()
+        except sqlite3.Error as e:
+            print(f"[DB ERROR] Failed to destroy session: {e}")
+        finally:
+            if 'conn' in locals():
+                conn.close()
 
-# Hash a password using SHA-256
 def hash_password(password):
-    return hashlib.sha256(password.encode('utf-8')).hexdigest()
+    """Hash password using SHA-256"""
+    if isinstance(password, str):
+        password = password.encode('utf-8')
+    return hashlib.sha256(password).hexdigest()
 
-# Generate a standard response format for API calls
 def make_response(status, message, data=None):
+    """Generate standard response format"""
     return json.dumps({
         "status": status,
         "message": message,
         "data": data or {}
     })
 
-# Validate if the username is alphanumeric and 3-20 characters long
 def is_valid_username(username):
+    """Validate username (alphanumeric, 3-20 characters)"""
     return bool(re.fullmatch(r"^[a-zA-Z0-9]{3,20}$", username))
 
-# Handle the login request by checking the provided credentials
-def handle_login(username, hashed_password):
-    users = load_users()  # Load all users
-    stored_hash = users.get(username)  # Retrieve stored password hash for the username
-    return stored_hash and stored_hash == hashed_password  # Return True if credentials match
+def handle_login(username, password):
+    """Handle login request"""
+    try:
+        conn = sqlite3.connect(DATABASE)
+        c = conn.cursor()
+        # Hash received raw password before comparison
+        password_hash = hash_password(password)
+        print(f"[DEBUG] Login attempt - Username: {username}, Hash: {password_hash}")
+        c.execute("SELECT id, password_hash FROM users WHERE username = ?", (username,))
+        row = c.fetchone()
+        if row:
+            print(f"[DEBUG] Found user - ID: {row[0]}, Stored Hash: {row[1]}")
+        if row and row[1] == password_hash:  # Compare hash values
+            # Update last login time
+            c.execute('''INSERT OR REPLACE INTO user_stats (user_id, last_login)
+                        VALUES (?, CURRENT_TIMESTAMP)''', (row[0],))
+            conn.commit()
+            return row[0]  # Return user ID
+        return None
+    except sqlite3.Error as e:
+        print(f"[DB ERROR] Login error: {e}")
+        return None
+    finally:
+        conn.close()
 
-# Receive data from a socket until a newline is encountered
+def handle_client_request(data, session_manager):
+    try:
+        request = json.loads(data)
+        action = request.get("action")
+        payload = request.get("payload", {})
+        token = request.get("auth_token")
+
+        if action == "register":
+            username = payload.get("username", "").strip()
+            password = payload.get("password", "").strip()  # Receive raw password
+
+            if not username or not password:
+                return make_response("error", "Username and password cannot be empty")
+
+            if not is_valid_username(username):
+                return make_response("error", "Username must be 3-20 alphanumeric characters")
+
+            if len(password) < 3:
+                return make_response("error", "Password must be at least 3 characters")
+
+            try:
+                conn = sqlite3.connect(DATABASE)
+                c = conn.cursor()
+                # Hash password on server side
+                password_hash = hash_password(password)
+                c.execute("INSERT INTO users (username, password_hash) VALUES (?, ?)",
+                         (username, password_hash))
+                user_id = c.lastrowid
+                c.execute("INSERT INTO user_stats (user_id) VALUES (?)", (user_id,))
+                conn.commit()
+                return make_response("success", "Registration successful")
+            except sqlite3.IntegrityError:
+                return make_response("error", "Username already exists")
+            except sqlite3.Error as e:
+                return make_response("error", f"Registration failed: {e}")
+            finally:
+                conn.close()
+
+        elif action == "login":
+            username = payload.get("username", "").strip()
+            password = payload.get("password", "").strip()  # Receive raw password
+
+            if not username or not password:
+                return make_response("error", "Username and password cannot be empty")
+
+            user_id = handle_login(username, password)  # Pass raw password
+            if user_id:
+                token = session_manager.create_session(user_id)
+                return make_response("success", "Login successful", {
+                    "auth_token": token,
+                    "username": username
+                })
+            return make_response("error", "Invalid username or password")
+
+        elif action == "logout":
+            if session_manager.validate_session(token):
+                session_manager.destroy_session(token)
+                return make_response("success", "Logout successful")
+            return make_response("error", "Invalid or expired session")
+
+        else:
+            return make_response("error", "Unknown operation")
+
+    except json.JSONDecodeError:
+        return make_response("error", "Invalid request format")
+    except Exception as e:
+        return make_response("error", f"Error processing request: {str(e)}")
+
 def recv_until_newline(sock):
+    """Receive data from socket until newline"""
     buffer = ''
     try:
         while True:
-            chunk = sock.recv(4096).decode('utf-8')  # Receive data in chunks
+            chunk = sock.recv(4096).decode('utf-8')
             if not chunk:
                 break
             buffer += chunk
-            if '\n' in buffer:  # Stop when newline is found
+            if '\n' in buffer:
                 break
         return buffer.strip()
     except (ConnectionResetError, OSError) as e:
         print(f"[SOCKET ERROR] Error receiving data: {e}")
-        return ''  # Return empty string on error
+        return ''
 
-# Handle client requests such as register, login, and logout
-def handle_client_request(data, session_manager):
-    try:
-        request = json.loads(data)  # Parse the incoming JSON request
-        action = request.get("action")  # Get the action from the request
-        payload = request.get("payload", {})  # Extract payload
-        token = request.get("auth_token")  # Extract token for session validation
-
-        if action == "register":
-            username = payload.get("username", "")
-            password = payload.get("password", "")
-
-            # Validate the username and password
-            if not is_valid_username(username):
-                return make_response("error", "Registration failed", {"username": "Invalid username, should be 3-20 alphanumeric characters"})
-
-            users = load_users()
-            if username in users:
-                return make_response("error", "Registration failed", {"username": "Username already exists"})
-
-            if len(password) < 8:
-                return make_response("error", "Registration failed", {"password": "Password must be at least 8 characters long"})
-
-            users[username] = hash_password(password)  # Save the new user with hashed password
-            save_users(users)
-            token = session_manager.create_session(username)
-            return make_response("success", "Registration successful", {"auth_token": token})
-
-
-        elif action == "login":
-            username = payload.get("username", "")
-            password = payload.get("password", "")
-            hashed_password = hash_password(password)  # Hash the password before checking
-
-            if handle_login(username, hashed_password):
-                token = session_manager.create_session(username)  # Create a session token
-                return make_response("success", "Login successful", {"auth_token": token})
-            else:
-                return make_response("error", "Invalid username or password")
-
-        elif action == "logout":
-            if session_manager.validate_session(token):  # Validate the session token
-                session_manager.destroy_session(token)  # Destroy the session
-                return make_response("success", "Logout successful")
-            else:
-                return make_response("error", "Invalid or expired session")
-
-        else:
-            return make_response("error", "Unknown action")
-
-    except json.JSONDecodeError:
-        return make_response("error", "Invalid request format, expected JSON")
-    except Exception as e:
-        return make_response("error", f"Error processing request: {str(e)}")
-
-# Start the server and handle client connections
 def start_server(host, port):
-    session_manager = SessionManager()  # Initialize session manager
+    """Start server and handle client connections"""
+    init_db()  # Initialize database
+    session_manager = SessionManager()
+
     with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as server_socket:
-        server_socket.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)  # Set socket options
-        server_socket.bind((host, port))  # Bind server to host and port
-        server_socket.listen(5)  # Start listening for incoming connections
+        server_socket.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+        server_socket.bind((host, port))
+        server_socket.listen(5)
         print(f"Server listening on {host}:{port}...")
 
         while True:
             try:
-                client_socket, client_address = server_socket.accept()  # Accept a new client connection
+                client_socket, client_address = server_socket.accept()
                 with client_socket:
                     print(f"Connection from {client_address}")
-                    data = recv_until_newline(client_socket)  # Receive client data
+                    data = recv_until_newline(client_socket)
                     if not data:
                         continue
                     print(f"Received request: {data}")
-                    response = handle_client_request(data, session_manager)  # Handle the request
-                    client_socket.sendall((response + '\n').encode('utf-8'))  # Send response back to client
+                    response = handle_client_request(data, session_manager)
+                    client_socket.sendall((response + '\n').encode('utf-8'))
             except Exception as e:
                 print(f"[SERVER ERROR] Error handling client request: {e}")
+
+if __name__ == "__main__":
+    start_server("localhost", 5000)

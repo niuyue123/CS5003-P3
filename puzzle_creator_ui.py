@@ -147,11 +147,24 @@ class PuzzleCreatorWindow(tk.Toplevel):
         row = event.y // self.cell_size
 
         if 0 <= row < self.grid_rows and 0 <= col < self.grid_cols:
+            # Check if there's a letter in this position
+            letter_tag = f"letter_{row}_{col}"
+            letter_items = self.grid_canvas.find_withtag(letter_tag)
+            
+            # If turning black and there's a letter, show warning
+            if not self.grid_state[row][col]['is_black'] and letter_items:
+                if not messagebox.askyesno("Warning", 
+                    "This cell contains a letter. Making it black will delete the letter. Continue?"):
+                    return
+
             # Toggle state
             self.grid_state[row][col]['is_black'] = not self.grid_state[row][col]['is_black']
             # Clear number if it becomes black
             if self.grid_state[row][col]['is_black']:
                 self.grid_state[row][col]['number'] = 0
+                # Delete letter (if exists)
+                if letter_items:
+                    self.grid_canvas.delete(letter_tag)
 
             # Recalculate numbers and update clue structures
             self._update_clue_numbers()
@@ -181,6 +194,13 @@ class PuzzleCreatorWindow(tk.Toplevel):
         x2, y2 = x1 + self.cell_size, y1 + self.cell_size
         tag = cell_data['tags']
 
+        # 保存当前单元格中的字母（如果有）
+        letter_tag = f"letter_{row}_{col}"
+        letter_items = self.grid_canvas.find_withtag(letter_tag)
+        letter_text = ""
+        if letter_items:
+            letter_text = self.grid_canvas.itemcget(letter_items[0], "text")
+
         self.grid_canvas.delete(tag) # Delete previous items for this cell
 
         fill_color = 'black' if cell_data['is_black'] else 'white'
@@ -192,7 +212,15 @@ class PuzzleCreatorWindow(tk.Toplevel):
                                           outline=outline_color,
                                           width=outline_width,
                                           tags=tag)
-        # Note: Numbers are drawn separately by _draw_numbers
+
+        # 如果单元格不是黑色且之前有字母，重新显示字母
+        if not cell_data['is_black'] and letter_text:
+            x = col * self.cell_size + self.cell_size/2
+            y = row * self.cell_size + self.cell_size/2
+            self.grid_canvas.create_text(x, y,
+                                       text=letter_text,
+                                       font=('Arial', 14),
+                                       tags=(letter_tag, "answer_letter"))
 
     def _draw_numbers(self):
         """Draws the clue numbers on the grid."""
@@ -321,10 +349,10 @@ class PuzzleCreatorWindow(tk.Toplevel):
         if num in self.clues_data and direction in self.clues_data[num]:
             # Basic validation
             if not clue_text:
-                 self.validation_label.config(text="Clue text cannot be empty.")
+                 self.validation_label.config(text="Clue text cannot be empty")
                  return
             if not answer_text:
-                 self.validation_label.config(text="Answer text cannot be empty.")
+                 self.validation_label.config(text="Answer cannot be empty")
                  return
             if not self._validate_answer_length(answer_text): # Check length
                 return # Message set by validation function
@@ -332,10 +360,37 @@ class PuzzleCreatorWindow(tk.Toplevel):
             # Update data
             self.clues_data[num][direction]['clue'] = clue_text
             self.clues_data[num][direction]['answer'] = answer_text
-            self.validation_label.config(text="Clue updated.", foreground="green")
+            self.validation_label.config(text="Clue updated", foreground="green")
+            
+            # Update letter display in grid
+            self._display_answer_in_grid(num, direction, answer_text)
         else:
-             self.validation_label.config(text="Error: Clue not found.", foreground="red")
+             self.validation_label.config(text="Error: Clue not found", foreground="red")
 
+    def _display_answer_in_grid(self, num, direction, answer):
+        """Display answer letters in the grid"""
+        if num not in self.clues_data:
+            return
+            
+        r_start, c_start = self.clues_data[num]['coords']
+        
+        for i, letter in enumerate(answer):
+            r, c = r_start, c_start
+            if direction == 'A':
+                c += i
+            else:  # direction == 'D'
+                r += i
+                
+            if 0 <= r < self.grid_rows and 0 <= c < self.grid_cols:
+                # Delete previous letter (if exists)
+                self.grid_canvas.delete(f"letter_{r}_{c}")
+                # Add new letter
+                x = c * self.cell_size + self.cell_size/2
+                y = r * self.cell_size + self.cell_size/2
+                self.grid_canvas.create_text(x, y,
+                                          text=letter,
+                                          font=('Arial', 14),
+                                          tags=(f"letter_{r}_{c}", "answer_letter"))
 
     def _highlight_selected_clue_cells(self):
         """Highlights the cells on the grid corresponding to the selected clue."""
@@ -421,106 +476,208 @@ class PuzzleCreatorWindow(tk.Toplevel):
 
     def _submit_puzzle(self):
         """Handles final validation and puzzle submission process."""
+        # Collect all missing information
+        missing_info = []
+        
+        # 1. Check title
         title = self.title_entry.get().strip()
         if not title:
-            messagebox.showerror("Error", "Please enter a puzzle title.")
+            missing_info.append("- Puzzle title")
+
+        # Print debug information
+        print("[DEBUG] Current grid state:")
+        self._print_grid_state()
+
+        # 2. Check if grid is valid
+        valid_grid = False
+        white_cells = []
+        for r in range(self.grid_rows):
+            for c in range(self.grid_cols):
+                if not self.grid_state[r][c]['is_black']:
+                    valid_grid = True
+                    white_cells.append((r, c))
+        
+        if not valid_grid:
+            missing_info.append("- Grid design (at least one writable white cell needed)")
+        
+        print(f"[DEBUG] Found white cells: {white_cells}")
+
+        # 3. Check filled answers
+        filled_positions = self._get_filled_positions()
+        print(f"[DEBUG] Positions with letters: {filled_positions}")
+
+        # 4. Check clue information
+        print("[DEBUG] Current clue data:")
+        for num in sorted(self.clues_data.keys()):
+            clue_info = self.clues_data[num]
+            print(f"Number {num}:")
+            if 'A' in clue_info:
+                print(f"  Across - Clue: {clue_info['A'].get('clue', 'None')}, Answer: {clue_info['A'].get('answer', 'None')}")
+            if 'D' in clue_info:
+                print(f"  Down - Clue: {clue_info['D'].get('clue', 'None')}, Answer: {clue_info['D'].get('answer', 'None')}")
+
+        # 5. Check clues for each filled position
+        if filled_positions:
+            for r, c in filled_positions:
+                found = False
+                for num, clue_data in self.clues_data.items():
+                    if self._is_position_in_clue(r, c, num, clue_data):
+                        found = True
+                        break
+                if not found:
+                    missing_info.append(f"- Letter at row {r+1} column {c+1} has no corresponding clue")
+
+        # If there's missing information, show error message
+        if missing_info:
+            error_message = "Missing required information:\n\n" + "\n".join(missing_info)
+            messagebox.showerror("Creation Failed", error_message)
             return
 
-        # Final validation of clues
-        packaged_clues = self._package_clues_data()
-        if packaged_clues is None: # Validation failed during packaging
-            return
-
-        if not packaged_clues:
-             messagebox.showwarning("Warning", "No valid clues have been entered for this puzzle.")
-             # Allow submission of empty puzzle? Or return?
-             # return
-
-
-        # Package final payload
+        # All validation passed, prepare to submit data
         try:
-            puzzle_payload = {
-                "title": title,
-                "grid_layout": self._convert_grid_state_to_layout(),
-                "clues": packaged_clues
-            }
-            print("Submitting Payload:", puzzle_payload) # Debug
+            puzzle_data = self._prepare_puzzle_data(title)
+            print("[DEBUG] Prepared puzzle data:", puzzle_data)
 
-            # --- TODO: Replace print with actual network call ---
-            # response = self.parent.client_network.send_request("create_puzzle", puzzle_payload)
-            # if response and response.get("status") == "success":
-            #     messagebox.showinfo("Success", f"Puzzle '{title}' submitted successfully (ID: {response.get('data', {}).get('puzzle_id')}).")
-            #     self.destroy()
-            # else:
-            #     error_msg = response.get("message", "Unknown error") if response else "No response from server"
-            #     messagebox.showerror("Submission Failed", f"Could not submit puzzle: {error_msg}")
-
-            # --- Simulation for now ---
-            messagebox.showinfo("Success", "Puzzle submitted (simulated).")
-            self.destroy() # Close window on successful submission
+            # If callback function is set, call it
+            if hasattr(self, 'submit_callback') and callable(self.submit_callback):
+                self.submit_callback(puzzle_data)
+            else:
+                print("[DEBUG] No submit callback set, showing simulated success message")
+                messagebox.showinfo("Success", "Puzzle created successfully (simulated)")
+                self.destroy()
 
         except Exception as e:
-             messagebox.showerror("Error", f"Failed to prepare puzzle data: {e}")
+            print(f"[ERROR] Error preparing puzzle data: {str(e)}")
+            messagebox.showerror("Error", f"Error preparing puzzle data: {str(e)}")
 
+    def _print_grid_state(self):
+        """Print current grid state for debugging"""
+        for r in range(self.grid_rows):
+            row = []
+            for c in range(self.grid_cols):
+                if self.grid_state[r][c]['is_black']:
+                    row.append('#')
+                else:
+                    letter_tag = f"letter_{r}_{c}"
+                    letter_items = self.grid_canvas.find_withtag(letter_tag)
+                    if letter_items:
+                        letter = self.grid_canvas.itemcget(letter_items[0], "text")
+                        row.append(letter)
+                    else:
+                        row.append('.')
+            print(''.join(row))
+
+    def _is_position_in_clue(self, r, c, num, clue_data):
+        """Check if the specified position belongs to a clue"""
+        if 'coords' not in clue_data:
+            return False
+            
+        start_r, start_c = clue_data['coords']
+        
+        # Check across clue
+        if 'A' in clue_data:
+            if r == start_r and c >= start_c:
+                length = self._get_word_length(num, 'A')
+                if c < start_c + length:
+                    return True
+                    
+        # Check down clue
+        if 'D' in clue_data:
+            if c == start_c and r >= start_r:
+                length = self._get_word_length(num, 'D')
+                if r < start_r + length:
+                    return True
+                    
+        return False
+
+    def _prepare_puzzle_data(self, title):
+        """Prepare puzzle data for submission"""
+        # Create solution grid
+        solution_grid = []
+        for r in range(self.grid_rows):
+            row = []
+            for c in range(self.grid_cols):
+                if self.grid_state[r][c]['is_black']:
+                    row.append('#')
+                else:
+                    letter_tag = f"letter_{r}_{c}"
+                    letter_items = self.grid_canvas.find_withtag(letter_tag)
+                    if letter_items:
+                        letter = self.grid_canvas.itemcget(letter_items[0], "text")
+                        row.append(letter)
+                    else:
+                        row.append('.')
+            solution_grid.append(''.join(row))
+
+        return {
+            "title": title,
+            "grid": self._convert_grid_state_to_layout(),
+            "clues": self._package_clues_data(),
+            "solution_key": solution_grid,
+            "tags": []
+        }
+
+    def _get_filled_positions(self):
+        """Get all positions with filled letters"""
+        filled_positions = []
+        for r in range(self.grid_rows):
+            for c in range(self.grid_cols):
+                if not self.grid_state[r][c]['is_black']:
+                    letter_tag = f"letter_{r}_{c}"
+                    letter_items = self.grid_canvas.find_withtag(letter_tag)
+                    if letter_items:
+                        filled_positions.append((r, c))
+        return filled_positions
+
+    def _package_clues_data(self):
+        """Package filled clues and answers into the required format"""
+        # Initialize clues structure
+        packaged_clues = {
+            "across": [],
+            "down": []
+        }
+        
+        # Get all filled positions
+        filled_positions = self._get_filled_positions()
+        if not filled_positions:
+            return packaged_clues
+
+        # Process clues
+        processed_clues = set()
+        for r, c in filled_positions:
+            for num, clue_data in self.clues_data.items():
+                for direction in ['A', 'D']:
+                    if direction in clue_data and (num, direction) not in processed_clues:
+                        start_r, start_c = clue_data['coords']
+                        length = self._get_word_length(num, direction)
+                        
+                        # Check if this position belongs to current clue
+                        is_part_of_clue = False
+                        if direction == 'A' and r == start_r and c >= start_c and c < start_c + length:
+                            is_part_of_clue = True
+                        elif direction == 'D' and c == start_c and r >= start_r and r < start_r + length:
+                            is_part_of_clue = True
+                            
+                        if is_part_of_clue:
+                            clue_info = clue_data[direction]
+                            if clue_info.get('clue') and clue_info.get('answer'):
+                                # Add clue to appropriate list
+                                clue_text = f"{clue_info['clue']}"
+                                if direction == 'A':
+                                    packaged_clues['across'].append(clue_text)
+                                else:  # direction == 'D'
+                                    packaged_clues['down'].append(clue_text)
+                                processed_clues.add((num, direction))
+
+        return packaged_clues
 
     def _convert_grid_state_to_layout(self):
-        """Converts internal grid state to the API format (e.g., list of strings)."""
+        """Convert internal grid state to API required format (list of strings)"""
         layout = []
         for r in range(self.grid_rows):
             row_str = "".join(["#" if self.grid_state[r][c]['is_black'] else "." for c in range(self.grid_cols)])
             layout.append(row_str)
         return layout
-
-    def _package_clues_data(self):
-        """Validates and converts internal clues_data to the list format required by the API."""
-        packaged_clues = []
-        all_clues_valid = True
-        missing_clue_info = []
-
-        sorted_numbers = sorted(self.clues_data.keys())
-        for num in sorted_numbers:
-            coords = self.clues_data[num]['coords']
-            r, c = coords
-
-            if 'A' in self.clues_data[num]:
-                clue_info = self.clues_data[num]['A']
-                if clue_info.get('clue') and clue_info.get('answer'):
-                     # Validate length one last time before packaging
-                     expected_len = self._get_word_length(num, 'A')
-                     if len(clue_info['answer']) == expected_len:
-                         packaged_clues.append({
-                             "number": num, "direction": "A", "row": r, "col": c,
-                             "clue": clue_info['clue'], "answer": clue_info['answer']
-                         })
-                     else:
-                         all_clues_valid = False
-                         missing_clue_info.append(f"{num} Across (Answer length mismatch)")
-                elif clue_info.get('clue') or clue_info.get('answer'): # Partially filled
-                    all_clues_valid = False
-                    missing_clue_info.append(f"{num} Across (Incomplete)")
-
-
-            if 'D' in self.clues_data[num]:
-                clue_info = self.clues_data[num]['D']
-                if clue_info.get('clue') and clue_info.get('answer'):
-                    expected_len = self._get_word_length(num, 'D')
-                    if len(clue_info['answer']) == expected_len:
-                        packaged_clues.append({
-                             "number": num, "direction": "D", "row": r, "col": c,
-                             "clue": clue_info['clue'], "answer": clue_info['answer']
-                         })
-                    else:
-                         all_clues_valid = False
-                         missing_clue_info.append(f"{num} Down (Answer length mismatch)")
-                elif clue_info.get('clue') or clue_info.get('answer'): # Partially filled
-                    all_clues_valid = False
-                    missing_clue_info.append(f"{num} Down (Incomplete)")
-
-        if not all_clues_valid:
-            messagebox.showerror("Validation Error", "Some clues are incomplete or have incorrect answer lengths:\n- " + "\n- ".join(missing_clue_info))
-            return None # Indicate failure
-
-        return packaged_clues
 
     # --- Grid Size Change ---
     def _change_grid_size(self):
