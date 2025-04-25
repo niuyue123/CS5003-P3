@@ -1,8 +1,11 @@
+import re
 import socket
 import json
 import sqlite3
 from datetime import datetime
-from server_auth import SessionManager, hash_password, make_response, recv_until_newline
+from server_auth import SessionManager, hash_password, make_response, recv_until_newline, load_users, save_users, \
+    DATABASE
+
 
 class PuzzleManager:
     def __init__(self, conn):
@@ -210,7 +213,64 @@ def handle_client_request(data, session_manager, puzzle_manager, submission_mana
             if not session_manager.validate_session(token):
                 return make_response("error", "Invalid or expired session")
 
-        if action == "get_puzzles":
+        # Add registration handling
+        if action == "register":
+            username = payload.get("username", "").strip()
+            password = payload.get("password", "").strip()
+
+            # Validate that both username and password are not emptyq
+            if not username or not password:
+                return make_response("error", "Username and password cannot be empty")
+
+            # Validate username
+            if not re.match(r'^[a-zA-Z0-9_]{2,20}$', username):
+                return make_response("error", "Username must be 2-20 characters of letters or digits")
+
+            # Validate password strength (at least 3 characters)
+            if len(password) < 3:
+                return make_response("error", "Password must be at least 3 characters long", {"field": "password"})
+
+            # Check if user already exists
+            users = load_users()
+            if username in users:
+                return make_response("error", "Username already exists")
+
+            # Only save if all validations pass
+            users[username] = password
+            save_users(users)
+            return make_response("success", "Registration successful")
+
+        elif action == "login":
+            username = payload.get("username", "").strip()
+            password = payload.get("password", "").strip()
+
+            # Input validation
+            if not username or not password:
+                return make_response("error", "Username and password cannot be empty")
+
+            # Load user database
+            users = load_users()
+
+            # Check if user exists
+            if username not in users:
+                return make_response("error", "Username does not exist", {"field": "username"})
+
+            # Password verification (note: client has already done SHA256 hashing)
+            if users[username] != password:
+                return make_response("error", "Incorrect password", {"field": "password"})
+
+            # Create session
+            token = session_manager.create_session(username)
+
+            # Update last login time
+            update_last_login(username)
+
+            return make_response("success", "Login successful", {
+                "auth_token": token,
+                "username": username
+            })
+
+        elif action == "get_puzzles":
             sort_by = payload.get("sort_by", "date")
             order = payload.get("order", "desc")
             tag = payload.get("tag")
@@ -255,6 +315,20 @@ def handle_client_request(data, session_manager, puzzle_manager, submission_mana
         return make_response("error", "Invalid request format")
     except Exception as e:
         return make_response("error", f"Error processing request: {str(e)}")
+
+
+def update_last_login(username):
+    """Update the user's last login time"""
+    try:
+        conn = sqlite3.connect(DATABASE)
+        c = conn.cursor()
+        c.execute("UPDATE user_stats SET last_login=CURRENT_TIMESTAMP WHERE user_id=?",
+                 (username,))
+        conn.commit()
+    except Exception as e:
+        print(f"Failed to update last login time: {e}")
+    finally:
+        conn.close()
 
 def start_server(host, port):
     # Initialize database connection
